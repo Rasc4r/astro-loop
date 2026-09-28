@@ -28,6 +28,10 @@ jobs:
 
       - name: Integrate AutoPilot
         run: python3 autopilot/apply_autopilot.py .
+        
+      - name: Clean Android resource backups
+        run: |
+          find app/src/main/res -type f -name '*.original.bak' -print -delete
 
       - name: Compile debug APK
         run: |

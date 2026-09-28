@@ -24,7 +24,7 @@ def replace_once(src, old, new, label):
 
 
 def main():
-    if not GAME.exists() or not GRADLE.exists() or not (ROOT / 'gradlew.bat').exists():
+    if not GAME.exists() or not GRADLE.exists() or not (ROOT / 'gradlew').exists():
         raise SystemExit('Pass the ROOT of the unmodified astro-loop source checkout.')
     data = GAME.read_text(encoding='utf-8')
     gradle = GRADLE.read_text(encoding='utf-8')

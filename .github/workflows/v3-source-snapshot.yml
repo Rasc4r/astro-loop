@@ -1,0 +1,200 @@
+name: V3 - Snapshot source Astro Loop
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout this exact fork commit
+        uses: actions/checkout@v4
+      - name: Generate source snapshot and Android dependency audit
+        shell: bash
+        run: |
+          cat > v3_source_audit.py <<'PY_AUDIT'
+          #!/usr/bin/env python3
+          """Reproducible source handoff + direct Android dependency audit for Astro Loop.
+          Only Python standard library. Does NOT claim to simulate the game.
+          """
+          from __future__ import annotations
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import sys
+          import zipfile
+          from pathlib import Path
+          from collections import Counter
+          from datetime import datetime, timezone
+
+          ROOT = Path(__file__).resolve().parents[2] if (Path(__file__).resolve().parents[2] / 'app' / 'src').exists() else Path.cwd().resolve()
+          OUT = ROOT / 'out_v3'
+          TARGETS = {
+            'Core runtime': ['core/GameSurfaceView.kt', 'core/GameState.kt', 'core/GameConfig.kt', 'core/GameThread.kt'],
+            'Movement/physics': ['entity/Ship.kt', 'util/Vector2.kt', 'system/MovementSystem.kt', 'system/CollisionSystem.kt'],
+            'Spawns/combat': ['system/SpawnSystem.kt', 'system/EnemySpawnSystem.kt', 'system/EnemyAISystem.kt', 'system/EnemyWeaponSystem.kt', 'system/WeaponSystem.kt'],
+            'Progression/choices': ['system/UpgradeSystem.kt', 'data/ShipDefinitions.kt', 'data/PilotDefinitions.kt'],
+            'Existing AutoPilot': ['core/AutoPilot.kt'],
+          }
+          PKG = Path('app/src/main/java/com/astroloop/game')
+          DISALLOWED_PARTS = {'.git', '.gradle', 'build', '.idea', '__pycache__', 'out_v3', '.vscode', 'node_modules', '.kotlin'}
+          SKIP_SUFFIXES = {'.jks', '.keystore', '.p12', '.pfx', '.pem', '.key', '.env'}
+          ROOT_FILES = {'gradlew', 'gradlew.bat', 'gradle.properties', 'settings.gradle', 'settings.gradle.kts', 'build.gradle', 'build.gradle.kts', 'README.md', 'LICENSE', 'LICENSE.md', 'proguard-rules.pro'}
+          MAX_BYTES = 60 * 1024 * 1024
+
+
+          def git(*args: str) -> str:
+              p = subprocess.run(['git', *args], cwd=ROOT, capture_output=True, text=True, check=False)
+              return p.stdout.strip() if p.returncode == 0 else 'unavailable'
+
+
+          def allowed(rel: Path) -> bool:
+              if any(part in DISALLOWED_PARTS for part in rel.parts): return False
+              if any(rel.name.lower().endswith(s) for s in SKIP_SUFFIXES): return False
+              if rel.name == 'local.properties' or rel.name.startswith('.env'): return False
+              if str(rel).startswith('app/src/'): return True
+              if str(rel).startswith('autopilot/'): return True
+              if str(rel).startswith('gradle/'): return True
+              if str(rel).startswith('.github/workflows/build-autopilot.yml'): return True
+              if str(rel).startswith('app/') and rel.name in ROOT_FILES: return True
+              if len(rel.parts) == 1 and rel.name in ROOT_FILES: return True
+              return False
+
+
+          def main() -> int:
+              src_dir = ROOT / PKG
+              if not (src_dir / 'core' / 'GameSurfaceView.kt').is_file():
+                  print('ERREUR: lancer depuis la racine du dépôt Astro Loop (app/src/main/java/.../GameSurfaceView.kt absent).', file=sys.stderr)
+                  return 2
+              OUT.mkdir(exist_ok=True)
+              files = []
+              total = 0
+              for path in ROOT.rglob('*'):
+                  if not path.is_file() or path.is_symlink(): continue
+                  rel = path.relative_to(ROOT)
+                  if not allowed(rel): continue
+                  size = path.stat().st_size
+                  if size > MAX_BYTES: continue
+                  total += size
+                  files.append((str(rel).replace('\\','/'), path, size))
+              files.sort(key=lambda a: a[0])
+              if total > 350 * 1024 * 1024:
+                  print('ERREUR: ensemble de sources trop volumineux; vérifier les fichiers inclus.', file=sys.stderr)
+                  return 3
+              manifest = {rel: hashlib.sha256(path.read_bytes()).hexdigest() for rel, path, _ in files}
+              commit = git('rev-parse','HEAD')
+              repo = git('remote', 'get-url', 'origin')
+              manifest_obj = {'commit': commit, 'origin': repo, 'files': manifest, 'file_count': len(manifest)}
+              (OUT / 'Source_Manifest.json').write_text(json.dumps(manifest_obj, indent=2, ensure_ascii=False), encoding='utf-8')
+              kotlin_files = [(rel, path) for rel, path, _ in files if rel.endswith('.kt')]
+              direct_android = []
+              pure_candidates = []
+              import_counts = Counter()
+              for rel, path in kotlin_files:
+                  text = path.read_text(encoding='utf-8', errors='replace')
+                  imports = re.findall(r'^\s*import\s+([\w.]+)', text, re.MULTILINE)
+                  for imp in imports:
+                      if imp.startswith(('android.', 'androidx.')): import_counts[imp.split('.')[0]] += 1
+                  if any(x.startswith(('android.', 'androidx.')) for x in imports) or re.search(r'\bandroid\.', text):
+                      direct_android.append(rel)
+                  else:
+                      pure_candidates.append(rel)
+              found = {}
+              for group, paths in TARGETS.items():
+                  for subpath in paths:
+                      f = src_dir / subpath
+                      if f.is_file():
+                          source = f.read_text(encoding='utf-8', errors='replace')
+                          found[subpath] = {'exists': True, 'lines': source.count('\n')+1, 'direct_android_import': any(x.startswith(('android.', 'androidx.')) for x in re.findall(r'^\s*import\s+([\w.]+)', source, re.MULTILINE)), 'sha256': hashlib.sha256(f.read_bytes()).hexdigest()}
+                      else: found[subpath] = {'exists': False}
+              view = (src_dir / 'core/GameSurfaceView.kt').read_text(encoding='utf-8', errors='replace')
+              config_path = src_dir / 'core/GameConfig.kt'
+              config = config_path.read_text(encoding='utf-8', errors='replace') if config_path.exists() else ''
+              fps_match = re.search(r'\bTARGET_FPS\s*=\s*([0-9]+)', config)
+              methods = {k: bool(re.search(r'\bfun\s+'+k+r'\s*\(', view)) for k in ['update', 'updatePlaying', 'updateUpgradeSelection', 'handlePlayerDeath']}
+              audit = {
+                  'repo_commit': commit, 'repo_origin': repo, 'kotlin_files': len(kotlin_files),
+                  'direct_android_files': len(direct_android), 'without_direct_android_import': len(pure_candidates),
+                  'android_files': direct_android, 'core_files': found, 'game_view_methods': methods,
+                  'target_fps_constant': int(fps_match.group(1)) if fps_match else None,
+                  'ship_choice_present': (src_dir / 'data/ShipDefinitions.kt').is_file(),
+                  'pilot_choice_present': (src_dir / 'data/PilotDefinitions.kt').is_file(),
+                  'legacy_autopilot_present': (src_dir / 'core/AutoPilot.kt').is_file(),
+                  'has_boss_timer_reference': 'SPAWN_TIME' in view,
+                  'source_file_count': len(manifest), 'snapshot_bytes': total,
+                  'note': 'Static analysis only: no complete headless simulation, no measured UPS.'
+              }
+              (OUT / 'Source_Audit.json').write_text(json.dumps(audit, indent=2, ensure_ascii=False), encoding='utf-8')
+              lines = [
+                  '# Astro Loop V3 — état des sources', '',
+                  f'- Commit exact: `{commit}`', f'- Remote: `{repo}`',
+                  f'- Fichiers inclus: {len(files)}; sources Kotlin: {len(kotlin_files)}',
+                  f'- Kotlin avec références Android directes: {len(direct_android)}',
+                  f'- Kotlin sans référence Android directe: {len(pure_candidates)} (pas une garantie de compatibilité JVM transitive)',
+                  f'- TARGET_FPS dans GameConfig: {fps_match.group(1) if fps_match else "non détecté"}',
+                  '', '## Points du moteur à extraire',
+                  '| Groupe | Fichier | Présent | Lignes | Couplage Android direct |',
+                  '|---|---|---:|---:|---:|',
+              ]
+              for group, paths in TARGETS.items():
+                  for subpath in paths:
+                      item = found[subpath]
+                      lines.append(f'| {group} | `{subpath}` | {"oui" if item["exists"] else "non"} | {item.get("lines", "—")} | {"oui" if item.get("direct_android_import") else "non"} |')
+              lines += [
+                  '', '## Étapes de portage',
+                  '1. Figer ce commit et relever les chemins/fichiers actuels; ne pas mélanger plusieurs versions du jeu.',
+                  '2. Extraire la logique de `GameSurfaceView.updatePlaying` vers un `GameSimulation.step(dt, action)` indépendant de Canvas, Activity, audio et télémétrie Android.',
+                  '3. Injecter une source de hasard graine fixe dans tous les systèmes de spawn et loot (chercher `Random`, `Math.random`, `shuffled`).',
+                  '4. Définir la fin d’épisode : décès ou troncature à 600 s; vérifier le comportement original à 600 s (boss/événement, pas nécessairement victoire).',
+                  '5. Valider la parité des pas sur états identiques : positions, PV, tirs, collisions, récompenses et choix de bonus.',
+                  '6. Ensuite seulement mesurer UPS de parties complètes, lancer 1/4/8/12/16 processus et intégrer le réseau neuronal.',
+                  '', 'Ce document est un AUDIT du code véritable, pas un benchmark du jeu complet.',
+              ]
+              (OUT / 'Source_Audit.md').write_text('\n'.join(lines)+'\n', encoding='utf-8')
+              path = OUT / 'AstroLoop_Source_Handoff.zip'
+              with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+                  for rel, file_path, _ in files:
+                      z.write(file_path, rel)
+                  for fn in ['Source_Manifest.json', 'Source_Audit.json', 'Source_Audit.md']:
+                      z.write(OUT / fn, 'v3_audit/' + fn)
+              with zipfile.ZipFile(path) as z:
+                  bad = z.testzip()
+                  if bad: raise RuntimeError('ZIP corrupted: ' + bad)
+                  if 'app/src/main/java/com/astroloop/game/core/GameSurfaceView.kt' not in z.namelist(): raise RuntimeError('GameSurfaceView missing')
+              print(f'OK source capture: {path} ({path.stat().st_size} bytes)')
+              print(f'OK commit: {commit}; Kotlin: {len(kotlin_files)}; direct Android: {len(direct_android)}')
+              print('ATTENTION: diagnostic de source uniquement, pas encore de moteur headless complet.')
+              return 0
+
+          if __name__ == '__main__':
+              raise SystemExit(main())
+          PY_AUDIT
+          python3 v3_source_audit.py
+      - name: Verify handoff
+        shell: bash
+        run: |
+          python3 - <<'PY_CHECK'
+          import zipfile, pathlib
+          p=pathlib.Path('out_v3/AstroLoop_Source_Handoff.zip')
+          assert p.is_file() and p.stat().st_size>0
+          with zipfile.ZipFile(p) as z:
+              assert z.testzip() is None
+              assert 'app/src/main/java/com/astroloop/game/core/GameSurfaceView.kt' in z.namelist()
+          print('ZIP integrity: PASS')
+          PY_CHECK
+      - name: Upload handoff files
+        uses: actions/upload-artifact@v4
+        with:
+          name: AstroLoop-V3-Source-Audit
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            out_v3/AstroLoop_Source_Handoff.zip
+            out_v3/Source_Audit.md
+            out_v3/Source_Audit.json
+            out_v3/Source_Manifest.json
